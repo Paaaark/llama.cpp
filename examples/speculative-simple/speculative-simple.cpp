@@ -109,7 +109,8 @@ int main(int argc, char ** argv) {
     // everything until here is standard initialization
     // the relevant stuff for speculative decoding starts here
 
-    const auto t_enc_start = ggml_time_us();
+    const auto t_ttft_start = ggml_time_us(); // wall-clock TTFT start (same definition as llama-cli: prefill start -> first token)
+    const auto t_enc_start = t_ttft_start;
 
     // target model sampling context
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
@@ -142,6 +143,9 @@ int main(int argc, char ** argv) {
     const auto t_enc_end = ggml_time_us();
 
     const auto t_dec_start = ggml_time_us();
+
+    int64_t t_ttft_end_us = 0;
+    bool ttft_first_token_done = false;
 
     while (true) {
         // optionally, generate draft tokens that can be appended to the target batch
@@ -184,6 +188,11 @@ int main(int argc, char ** argv) {
         //
         const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
 
+        if (!ttft_first_token_done) {
+            t_ttft_end_us = ggml_time_us();
+            ttft_first_token_done = true;
+        }
+
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
@@ -218,6 +227,9 @@ int main(int argc, char ** argv) {
         }
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
+        if (params.speculative.accept_stats) {
+            LOG_INF("accept_step draft=%zu accept=%zu\n", draft.size(), ids.size() - 1);
+        }
 
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
@@ -236,6 +248,9 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
 
+    if (ttft_first_token_done && t_ttft_end_us > 0) {
+        LOG_INF("ttft_ms = %.2f\n", (t_ttft_end_us - t_ttft_start) / 1000.0f);
+    }
     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
 

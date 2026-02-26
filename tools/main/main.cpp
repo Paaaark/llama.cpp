@@ -41,6 +41,11 @@ static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
 
+// Wall-clock TTFT: start of prefill -> first token sampled (same definition as speculative-simple)
+static int64_t s_ttft_start_us       = 0;
+static int64_t s_ttft_first_token_us = 0;
+static bool    s_ttft_first_token_done = false;
+
 static void print_usage(int argc, char ** argv) {
     (void) argc;
 
@@ -71,6 +76,9 @@ static void sigint_handler(int signo) {
         } else {
             console::cleanup();
             LOG("\n");
+            if (s_ttft_first_token_done && s_ttft_start_us > 0) {
+                LOG_INF("ttft_ms = %.2f\n", (s_ttft_first_token_us - s_ttft_start_us) / 1000.0);
+            }
             common_perf_print(*g_ctx, *g_smpl);
 
             // make sure all logs are flushed
@@ -559,6 +567,8 @@ int main(int argc, char ** argv) {
     }
 
     if (llama_model_has_encoder(model)) {
+        s_ttft_start_us = ggml_time_us();
+        s_ttft_first_token_done = false;
         int enc_input_size = embd_inp.size();
         llama_token * enc_input_buf = embd_inp.data();
 
@@ -674,6 +684,10 @@ int main(int argc, char ** argv) {
                 }
             }
 
+            if (!embd.empty()) {
+                s_ttft_start_us = ggml_time_us();
+                s_ttft_first_token_done = false;
+            }
             for (int i = 0; i < (int) embd.size(); i += params.n_batch) {
                 int n_eval = (int) embd.size() - i;
                 if (n_eval > params.n_batch) {
@@ -715,6 +729,10 @@ int main(int argc, char ** argv) {
 
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
+            if (!s_ttft_first_token_done) {
+                s_ttft_first_token_us = ggml_time_us();
+                s_ttft_first_token_done = true;
+            }
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
@@ -993,6 +1011,9 @@ int main(int argc, char ** argv) {
     }
 
     LOG("\n\n");
+    if (s_ttft_first_token_done && s_ttft_start_us > 0) {
+        LOG_INF("ttft_ms = %.2f\n", (s_ttft_first_token_us - s_ttft_start_us) / 1000.0);
+    }
     common_perf_print(ctx, smpl);
 
     common_sampler_free(smpl);

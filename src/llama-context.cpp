@@ -435,16 +435,22 @@ void llama_context::synchronize() {
     // this should only happen when using batch size 1 to evaluate a batch
 
     // add the evaluation to the stats
+    // Multi-token batches with min position 0 = prefill (prompt eval); min position > 0 = verification/extension (eval)
     if (n_queued_tokens == 1) {
         if (!cparams.no_perf) {
             t_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_eval++;
-    } else if (n_queued_tokens > 1) {
+    } else if (n_queued_tokens > 1 && min_queued_pos == 0) {
         if (!cparams.no_perf) {
             t_p_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_p_eval += n_queued_tokens;
+    } else if (n_queued_tokens > 1 && min_queued_pos > 0) {
+        if (!cparams.no_perf) {
+            t_eval_us += ggml_time_us() - t_compute_start_us;
+        }
+        n_eval++;
     }
 
     // get a more accurate load time, upon first eval
@@ -454,6 +460,7 @@ void llama_context::synchronize() {
     }
 
     n_queued_tokens = 0;
+    min_queued_pos  = 0;
     t_compute_start_us = 0;
 }
 
@@ -853,6 +860,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
 
+    min_queued_pos  = 0; // encode is always prefill
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
@@ -1025,6 +1033,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
+    }
+    // Distinguish prefill (positions from 0) from verification/extension (min_pos > 0) for perf stats
+    if (batch_inp.pos != nullptr) {
+        llama_pos p_min = batch_inp.pos[0];
+        for (int32_t i = 1; i < batch_inp.n_tokens; ++i) {
+            if (batch_inp.pos[i] < p_min) {
+                p_min = batch_inp.pos[i];
+            }
+        }
+        min_queued_pos = p_min;
+    } else {
+        min_queued_pos = 0;
     }
     n_queued_tokens += n_tokens_all;
 
@@ -2165,6 +2185,7 @@ void llama_context::opt_epoch_iter(
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
 
+        min_queued_pos   = pos_ctx; // first batch pos_ctx==0 → prompt eval; later → eval
         n_queued_tokens += n_tokens_all;
 
         embd_seq.clear();

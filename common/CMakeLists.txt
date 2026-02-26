@@ -97,6 +97,9 @@ elseif (LLAMA_HTTPLIB)
     # otherwise, use cpp-httplib
     target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_HTTPLIB)
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} cpp-httplib)
+    if (WIN32)
+        list(APPEND LLAMA_COMMON_EXTRA_LIBS ws2_32)
+    endif()
 endif()
 
 if (LLAMA_LLGUIDANCE)
