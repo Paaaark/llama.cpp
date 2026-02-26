@@ -684,7 +684,8 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            if (!embd.empty()) {
+            // TTFT start only for initial prefill (multi-token batch), not for single-token decode steps
+            if (!embd.empty() && (int) embd.size() > 1) {
                 s_ttft_start_us = ggml_time_us();
                 s_ttft_first_token_done = false;
             }

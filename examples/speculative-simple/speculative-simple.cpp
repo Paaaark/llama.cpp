@@ -109,7 +109,10 @@ int main(int argc, char ** argv) {
     // everything until here is standard initialization
     // the relevant stuff for speculative decoding starts here
 
-    const auto t_ttft_start = ggml_time_us(); // wall-clock TTFT start (same definition as llama-cli: prefill start -> first token)
+    // TTFT = time to first token: from start of generation until first token is available.
+    // Start here (before target prefill); end after first sample_and_accept_n. Includes:
+    // target prefill, first draft run (draft prefill + draft decodes), and first verification.
+    const auto t_ttft_start = ggml_time_us();
     const auto t_enc_start = t_ttft_start;
 
     // target model sampling context
@@ -117,6 +120,8 @@ int main(int argc, char ** argv) {
 
     // eval the prompt
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
+    llama_synchronize(ctx_tgt); // wait for prefill to finish so "encoded" time is accurate (decode is async)
+    const auto t_enc_end = ggml_time_us(); // end of prefill only (comparable to baseline prompt_eval)
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -139,8 +144,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-
-    const auto t_enc_end = ggml_time_us();
 
     const auto t_dec_start = ggml_time_us();
 
