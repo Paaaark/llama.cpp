@@ -2833,6 +2833,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--draft-no-early-stop"},
+        "disable early stopping: always draft up to draft-max tokens (default: stop when top-token prob < draft-p-min; use for accept-curve)",
+        [](common_params & params) {
+            params.speculative.draft_early_stop = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--draft-no-deterministic"},
+        "draft model uses top_k=10 instead of greedy (top_k=1); default is deterministic (greedy)",
+        [](common_params & params) {
+            params.speculative.draft_deterministic = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
         {"-cd", "--ctx-size-draft"}, "N",
         string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.n_ctx),
         [](common_params & params, int value) {

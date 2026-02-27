@@ -47,19 +47,19 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
-    // load the draft model
-    params.devices      = params.speculative.devices;
-    params.model        = params.speculative.model;
-    params.n_ctx        = params.speculative.n_ctx;
-    params.n_batch      = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : params.n_batch;
-    params.n_gpu_layers = params.speculative.n_gpu_layers;
+    // save target CPU params before overwriting for draft (used for threadpool affinity)
+    cpu_params cpuparams_tgt       = params.cpuparams;
+    cpu_params cpuparams_batch_tgt = params.cpuparams_batch;
 
-    if (params.speculative.cpuparams.n_threads > 0) {
-        params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
-    }
-
-    params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
-    params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
+    // load the draft model (use full speculative cpuparams so draft gets its own threads + affinity)
+    params.devices               = params.speculative.devices;
+    params.model                 = params.speculative.model;
+    params.n_ctx                 = params.speculative.n_ctx;
+    params.n_batch               = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : params.n_batch;
+    params.n_gpu_layers          = params.speculative.n_gpu_layers;
+    params.cpuparams              = params.speculative.cpuparams;
+    params.cpuparams_batch        = params.speculative.cpuparams_batch;
+    params.tensor_buft_overrides  = params.speculative.tensor_buft_overrides;
 
     common_init_result llama_init_dft = common_init_from_params(params);
 
@@ -68,6 +68,35 @@ int main(int argc, char ** argv) {
 
     if (!common_speculative_are_compatible(ctx_tgt, ctx_dft)) {
         LOG_INF("the draft model '%s' is not compatible with the target model '%s'. tokens will be translated between the draft and target models.\n", params.speculative.model.path.c_str(), params.model.path.c_str());
+    }
+
+    // attach threadpools with CPU affinity (target = main cpuparams, draft = speculative cpuparams)
+    {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+            auto ggml_threadpool_new_fn  = reinterpret_cast<struct ggml_threadpool * (*)(struct ggml_threadpool_params *)>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
+            auto ggml_threadpool_free_fn = reinterpret_cast<void (*)(struct ggml_threadpool *)>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
+            if (ggml_threadpool_new_fn && ggml_threadpool_free_fn) {
+                struct ggml_threadpool_params tpp_tgt       = ggml_threadpool_params_from_cpu_params(cpuparams_tgt);
+                struct ggml_threadpool_params tpp_tgt_batch = ggml_threadpool_params_from_cpu_params(cpuparams_batch_tgt);
+                struct ggml_threadpool_params tpp_dft       = ggml_threadpool_params_from_cpu_params(params.cpuparams);
+                struct ggml_threadpool_params tpp_dft_batch = ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+
+                struct ggml_threadpool * threadpool_tgt = ggml_threadpool_new_fn(&tpp_tgt);
+                struct ggml_threadpool * threadpool_tgt_batch = ggml_threadpool_params_match(&tpp_tgt, &tpp_tgt_batch) ? nullptr : ggml_threadpool_new_fn(&tpp_tgt_batch);
+                struct ggml_threadpool * threadpool_dft = ggml_threadpool_new_fn(&tpp_dft);
+                struct ggml_threadpool * threadpool_dft_batch = ggml_threadpool_params_match(&tpp_dft, &tpp_dft_batch) ? nullptr : ggml_threadpool_new_fn(&tpp_dft_batch);
+
+                if (threadpool_tgt) {
+                    llama_attach_threadpool(ctx_tgt, threadpool_tgt, threadpool_tgt_batch);
+                }
+                if (threadpool_dft) {
+                    llama_attach_threadpool(ctx_dft, threadpool_dft, threadpool_dft_batch);
+                }
+                // threadpools are owned by the context and freed on llama_free
+            }
+        }
     }
 
     // Tokenize the prompt
@@ -97,6 +126,7 @@ int main(int argc, char ** argv) {
     int n_draft_min = params.speculative.n_min;
 
     float p_min = params.speculative.p_min;
+    bool draft_early_stop = params.speculative.draft_early_stop;
 
     int n_predict = 0;
     int n_drafted = 0;
@@ -137,8 +167,9 @@ int main(int argc, char ** argv) {
     params_spec.n_draft = n_draft;
     params_spec.n_reuse = llama_n_ctx(ctx_dft) - n_draft;
     params_spec.p_min   = p_min;
+    params_spec.early_stop = draft_early_stop;
 
-    struct common_speculative * spec = common_speculative_init(ctx_tgt, ctx_dft);
+    struct common_speculative * spec = common_speculative_init(ctx_tgt, ctx_dft, params.speculative.draft_deterministic);
     for (auto &pair : params.speculative.replacements) {
         common_speculative_add_replacement_tgt_dft(spec, pair.first.c_str(), pair.second.c_str());
     }

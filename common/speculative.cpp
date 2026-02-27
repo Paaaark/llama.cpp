@@ -26,7 +26,8 @@ struct common_speculative {
 
 struct common_speculative * common_speculative_init(
         struct llama_context * ctx_tgt,
-        struct llama_context * ctx_dft) {
+        struct llama_context * ctx_dft,
+        bool draft_deterministic) {
     auto * result = new common_speculative {
         /* .ctx_tgt    = */ ctx_tgt,
         /* .ctx_dft    = */ ctx_dft,
@@ -36,37 +37,13 @@ struct common_speculative * common_speculative_init(
         /* .vocab_dft_compatible = */ false,
     };
 
-    // TODO: optimize or pass from outside?
-#if 0
     {
         common_params_sampling params;
         params.no_perf = false;
-
-        params.top_k = 40;
-        params.top_p = 0.9;
-
-        params.samplers = {
-            COMMON_SAMPLER_TYPE_TOP_K,
-            COMMON_SAMPLER_TYPE_TOP_P,
-            COMMON_SAMPLER_TYPE_INFILL,
-        };
-
+        params.top_k = draft_deterministic ? 1 : 10;  // greedy = deterministic
+        params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
         result->smpl = common_sampler_init(llama_get_model(ctx_dft), params);
     }
-#else
-    {
-        common_params_sampling params;
-        params.no_perf = false;
-
-        params.top_k = 10;
-
-        params.samplers = {
-            COMMON_SAMPLER_TYPE_TOP_K,
-        };
-
-        result->smpl = common_sampler_init(llama_get_model(ctx_dft), params);
-    }
-#endif
 
     result->vocab_dft_compatible = common_speculative_are_compatible(ctx_tgt, ctx_dft);
     LOG_DBG("vocab_dft_compatible = %d\n", result->vocab_dft_compatible);
@@ -335,8 +312,8 @@ llama_tokens common_speculative_gen_draft(
             break;
         }
 
-        // only collect very high-confidence draft tokens
-        if (cur_p->data[0].p < params.p_min) {
+        // early stop: only collect high-confidence draft tokens (when early_stop; disable for accept-curve)
+        if (params.early_stop && cur_p->data[0].p < params.p_min) {
             break;
         }
 

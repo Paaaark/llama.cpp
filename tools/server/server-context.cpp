@@ -704,7 +704,7 @@ struct server_context_impl {
                     return;
                 }
 
-                slot.spec = common_speculative_init(slot.ctx, slot.ctx_dft);
+                slot.spec = common_speculative_init(slot.ctx, slot.ctx_dft, params_base.speculative.draft_deterministic);
                 if (slot.spec == nullptr) {
                     SRV_ERR("%s", "failed to create speculator\n");
                     return;

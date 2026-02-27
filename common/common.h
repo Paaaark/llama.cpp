@@ -234,6 +234,8 @@ struct common_params_speculative {
     int32_t n_gpu_layers =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     float   p_split      =  0.1f; // speculative decoding split probability
     float   p_min        = 0.75f; // minimum speculative decoding probability (greedy)
+    bool    draft_early_stop = true; // stop drafting when top-token prob < p_min (disable for accept-curve)
+    bool    draft_deterministic = true; // draft model greedy (top_k=1); false = top_k=10
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
