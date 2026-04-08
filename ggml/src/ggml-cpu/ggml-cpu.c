@@ -2524,7 +2524,9 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#elif defined(__gnu_linux__)
+/* Bionic (Android) defines __linux__ and __ANDROID__ but typically not __gnu_linux__;
+ * without this branch, ggml_thread_apply_affinity is compiled as a no-op and -C has no effect. */
+#elif defined(__gnu_linux__) || defined(__ANDROID__)
 // TODO: this may not work on BSD, to be verified
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
