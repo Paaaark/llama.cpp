@@ -209,7 +209,7 @@ struct speculative_loop {
         llama_batch_free(batch_tgt);
     }
 
-    void prefill(const std::vector<llama_token> & inp) {
+    void prefill(std::vector<llama_token> & inp) {
         n_input = static_cast<int>(inp.size());
 
         threadpools.pause_target_phase();
