@@ -243,6 +243,7 @@ struct common_params_speculative {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     bool accept_stats = false; // print per-step draft/accept counts for accept-curve analysis
+    bool use_steward  = false; // run decode-driving speculative work on a dedicated thread
 
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
