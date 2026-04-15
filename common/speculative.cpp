@@ -158,16 +158,26 @@ static std::string replace_to_tgt(
     return result;
 }
 
+static std::string detokenize_token(
+        const struct llama_vocab * vocab,
+        llama_token token) {
+    int32_t n_chars = llama_detokenize(vocab, &token, 1, nullptr, 0, false, false);
+    GGML_ASSERT(n_chars < 0 && "failed to detokenize token");
 
-llama_tokens common_speculative_gen_draft(
+    std::string text;
+    text.resize(-n_chars);
+    llama_detokenize(vocab, &token, 1, text.data(), text.size(), false, false);
+    return text;
+}
+
+static llama_tokens common_speculative_gen_draft_tokens_internal(
         struct common_speculative * spec,
         struct common_speculative_params params,
-        const llama_tokens & prompt_tgt_main_model, // specified in target model vocab
+        const llama_tokens & prompt_tgt,
         llama_token id_last) {
-    auto & batch  = spec->batch;
-    auto & ctx_tgt = spec->ctx_tgt;
-    auto & ctx_dft = spec->ctx_dft;
-    auto & smpl   = spec->smpl;
+    auto & batch      = spec->batch;
+    auto & ctx_dft    = spec->ctx_dft;
+    auto & smpl       = spec->smpl;
     auto & prompt_dft = spec->prompt_dft;
 
     auto * mem_dft = llama_get_memory(ctx_dft);
@@ -176,31 +186,6 @@ llama_tokens common_speculative_gen_draft(
     int reuse_n = 0;
 
     const int n_ctx = llama_n_ctx(ctx_dft) - params.n_draft;
-
-    llama_tokens prompt_tgt_draft_model;
-    if (!spec->vocab_dft_compatible) {
-        std::string text;
-        text = common_detokenize(ctx_tgt, prompt_tgt_main_model, true);
-        text = replace_to_dft(spec, text);
-        LOG_DBG("%s: main->draft detokenized string: '%s'\n", __func__, text.c_str());
-        prompt_tgt_draft_model = common_tokenize(ctx_dft, text, false, true);
-
-        // convert id_last to draft vocab. llama_detokenize is called directly to avoid an allocation
-        const auto * model_tgt = llama_get_model(ctx_tgt);
-        const auto * vocab_tgt = llama_model_get_vocab(model_tgt);
-
-        int32_t n_chars = llama_detokenize(vocab_tgt, &id_last, 1, nullptr, 0, false, false);
-        GGML_ASSERT(n_chars < 0 && "failed to detokenize id_last");
-        text.resize(-n_chars);
-        llama_detokenize(vocab_tgt, &id_last, 1, text.data(), text.size(), false, false);
-        text = replace_to_dft(spec, text);
-
-        LOG_DBG("main->draft detokenized id_last(%d): '%s'\n", id_last, text.c_str());
-        id_last = common_tokenize(ctx_dft, text, false, true)[0];
-    }
-    // prompt_tgt's tokens will always be compatible with ctx_dft
-    const llama_tokens &prompt_tgt =
-        spec->vocab_dft_compatible ? prompt_tgt_main_model : prompt_tgt_draft_model;
 
     const int i_start = std::max<int>(0, (int) prompt_tgt.size() - n_ctx);
 
@@ -260,7 +245,6 @@ llama_tokens common_speculative_gen_draft(
     common_batch_clear(batch);
 
     for (size_t i = i_start + reuse_n; i < prompt_tgt.size(); ++i) {
-        //LOG_DBG("i = %d, i_start = %d, reuse_n = %d, i - i_start = %d, id = %6d\n", i, i_start, reuse_n, i - i_start, prompt_tgt[i]);
         common_batch_add(batch, prompt_tgt[i], i - i_start, { 0 }, false);
 
         prompt_dft.push_back(prompt_tgt[i]);
@@ -268,8 +252,6 @@ llama_tokens common_speculative_gen_draft(
 
     // we should rarely end-up here during normal decoding
     if (batch.n_tokens > 0) {
-        //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
-
         llama_decode(ctx_dft, batch);
     }
 
@@ -325,14 +307,87 @@ llama_tokens common_speculative_gen_draft(
         prompt_dft.push_back(id);
     }
 
-    if (!spec->vocab_dft_compatible) {
-        std::string detokenized = common_detokenize(ctx_dft, result, true);
-        detokenized = replace_to_tgt(spec, detokenized);
-        LOG_DBG("draft->main detokenized string: '%s'\n", detokenized.c_str());
-        result = common_tokenize(ctx_tgt, detokenized, false, true);
-        if (result.size() > (size_t)params.n_draft) {
-            result.resize(params.n_draft);
-        }
-    }
     return result;
+}
+
+struct common_speculative_draft_request common_speculative_prepare_draft_request(
+        struct common_speculative * spec,
+        const llama_tokens & prompt_tgt_main_model,
+        llama_token id_last) {
+    struct common_speculative_draft_request request;
+    request.vocab_dft_compatible = spec->vocab_dft_compatible;
+
+    if (spec->vocab_dft_compatible) {
+        request.prompt_tokens = prompt_tgt_main_model;
+        request.id_last = id_last;
+        return request;
+    }
+
+    request.prompt_text = replace_to_dft(spec, common_detokenize(spec->ctx_tgt, prompt_tgt_main_model, true));
+    LOG_DBG("%s: main->draft detokenized string: '%s'\n", __func__, request.prompt_text.c_str());
+
+    const auto * model_tgt = llama_get_model(spec->ctx_tgt);
+    const auto * vocab_tgt = llama_model_get_vocab(model_tgt);
+
+    request.id_last_text = replace_to_dft(spec, detokenize_token(vocab_tgt, id_last));
+    LOG_DBG("%s: main->draft detokenized id_last(%d): '%s'\n", __func__, id_last, request.id_last_text.c_str());
+
+    return request;
+}
+
+struct common_speculative_draft_result common_speculative_gen_draft_result(
+        struct common_speculative * spec,
+        struct common_speculative_params params,
+        const struct common_speculative_draft_request & request) {
+    struct common_speculative_draft_result result;
+    result.vocab_dft_compatible = request.vocab_dft_compatible;
+
+    llama_tokens prompt_tgt;
+    llama_token id_last = request.id_last;
+
+    if (request.vocab_dft_compatible) {
+        prompt_tgt = request.prompt_tokens;
+    } else {
+        prompt_tgt = common_tokenize(spec->ctx_dft, request.prompt_text, false, true);
+
+        const llama_tokens id_last_tokens = common_tokenize(spec->ctx_dft, request.id_last_text, false, true);
+        GGML_ASSERT(!id_last_tokens.empty() && "failed to tokenize id_last for draft");
+        id_last = id_last_tokens[0];
+    }
+
+    result.tokens = common_speculative_gen_draft_tokens_internal(spec, params, prompt_tgt, id_last);
+
+    if (!request.vocab_dft_compatible) {
+        result.text = replace_to_tgt(spec, common_detokenize(spec->ctx_dft, result.tokens, true));
+        LOG_DBG("%s: draft->main detokenized string: '%s'\n", __func__, result.text.c_str());
+    }
+
+    return result;
+}
+
+llama_tokens common_speculative_finalize_draft_result(
+        struct common_speculative * spec,
+        const struct common_speculative_draft_result & result,
+        int n_draft) {
+    if (result.vocab_dft_compatible) {
+        return result.tokens;
+    }
+
+    llama_tokens tokens = common_tokenize(spec->ctx_tgt, result.text, false, true);
+    if (n_draft > 0 && tokens.size() > (size_t) n_draft) {
+        tokens.resize(n_draft);
+    }
+
+    return tokens;
+}
+
+
+llama_tokens common_speculative_gen_draft(
+        struct common_speculative * spec,
+        struct common_speculative_params params,
+        const llama_tokens & prompt_tgt_main_model, // specified in target model vocab
+        llama_token id_last) {
+    const auto request = common_speculative_prepare_draft_request(spec, prompt_tgt_main_model, id_last);
+    const auto result = common_speculative_gen_draft_result(spec, params, request);
+    return common_speculative_finalize_draft_result(spec, result, params.n_draft);
 }

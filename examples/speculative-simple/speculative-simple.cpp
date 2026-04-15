@@ -141,17 +141,40 @@ private:
     std::thread worker_;
 };
 
-struct speculative_loop {
+struct draft_worker_state {
+    const speculative_threadpools & threadpools;
+    common_speculative * spec;
+    common_speculative_params params_spec;
+
+    draft_worker_state(
+            llama_context * ctx_dft,
+            const common_params & params,
+            const speculative_threadpools & threadpools,
+            common_speculative * spec) :
+        threadpools(threadpools),
+        spec(spec) {
+        params_spec.n_draft = params.speculative.n_max;
+        params_spec.n_reuse = llama_n_ctx(ctx_dft) - params.speculative.n_max;
+        params_spec.p_min   = params.speculative.p_min;
+        params_spec.early_stop = params.speculative.draft_early_stop;
+    }
+
+    common_speculative_draft_result generate(const common_speculative_draft_request & request) const {
+        threadpools.pause_draft_phase();
+        return common_speculative_gen_draft_result(spec, params_spec, request);
+    }
+};
+
+struct target_worker_state {
     llama_context * ctx_tgt;
     llama_context * ctx_dft;
     const llama_vocab * vocab;
     const common_params & params;
     const speculative_threadpools & threadpools;
+    common_speculative * spec;
 
     common_sampler * smpl;
-    common_speculative * spec;
     llama_batch batch_tgt;
-    common_speculative_params params_spec;
 
     llama_tokens prompt_tgt;
     llama_token id_last = 0;
@@ -174,38 +197,29 @@ struct speculative_loop {
     int64_t t_ttft_end_us = 0;
     bool ttft_first_token_done = false;
 
-    speculative_loop(
+    target_worker_state(
             llama_context * ctx_tgt,
             llama_context * ctx_dft,
             const llama_vocab * vocab,
             const common_params & params,
             const speculative_threadpools & threadpools,
+            common_speculative * spec,
             int64_t t_ttft_start) :
         ctx_tgt(ctx_tgt),
         ctx_dft(ctx_dft),
         vocab(vocab),
         params(params),
         threadpools(threadpools),
+        spec(spec),
         smpl(common_sampler_init(llama_get_model(ctx_tgt), params.sampling)),
-        spec(common_speculative_init(ctx_tgt, ctx_dft, params.speculative.draft_deterministic)),
         batch_tgt(llama_batch_init(llama_n_batch(ctx_tgt), 0, 1)),
         n_draft(params.speculative.n_max),
         n_draft_min(params.speculative.n_min),
         t_ttft_start(t_ttft_start),
-        t_enc_start(t_ttft_start) {
-        params_spec.n_draft = n_draft;
-        params_spec.n_reuse = llama_n_ctx(ctx_dft) - n_draft;
-        params_spec.p_min   = params.speculative.p_min;
-        params_spec.early_stop = params.speculative.draft_early_stop;
+        t_enc_start(t_ttft_start) {}
 
-        for (const auto & pair : params.speculative.replacements) {
-            common_speculative_add_replacement_tgt_dft(spec, pair.first.c_str(), pair.second.c_str());
-        }
-    }
-
-    ~speculative_loop() {
+    ~target_worker_state() {
         common_sampler_free(smpl);
-        common_speculative_free(spec);
         llama_batch_free(batch_tgt);
     }
 
@@ -226,9 +240,12 @@ struct speculative_loop {
         t_dec_start = ggml_time_us();
     }
 
-    bool step() {
-        threadpools.pause_draft_phase();
-        llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
+    common_speculative_draft_request prepare_draft_request() const {
+        return common_speculative_prepare_draft_request(spec, prompt_tgt, id_last);
+    }
+
+    bool apply_draft_result(const common_speculative_draft_result & draft_result) {
+        llama_tokens draft = common_speculative_finalize_draft_result(spec, draft_result, n_draft);
 
         common_batch_clear(batch_tgt);
         common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
@@ -455,22 +472,37 @@ int main(int argc, char ** argv) {
         LOG("%s", common_token_to_piece(ctx_tgt, id).c_str());
     }
 
+    common_speculative * spec = common_speculative_init(ctx_tgt, ctx_dft, params.speculative.draft_deterministic);
+    for (const auto & pair : params.speculative.replacements) {
+        common_speculative_add_replacement_tgt_dft(spec, pair.first.c_str(), pair.second.c_str());
+    }
+
     // TTFT = time to first token: from start of generation until first token is available.
     // Start here (before target prefill); end after first sample_and_accept_n. Includes:
     // target prefill, first draft run (draft prefill + draft decodes), and first verification.
     const auto t_ttft_start = ggml_time_us();
-    speculative_loop loop(ctx_tgt, ctx_dft, vocab, params, threadpools, t_ttft_start);
+    target_worker_state target_worker(ctx_tgt, ctx_dft, vocab, params, threadpools, spec, t_ttft_start);
+    draft_worker_state draft_worker(ctx_dft, params, threadpools, spec);
 
     if (params.speculative.use_steward) {
-        sequential_steward steward;
+        sequential_steward target_steward;
+        sequential_steward draft_steward;
 
-        steward.submit([&loop, &inp]() {
-            loop.prefill(inp);
+        target_steward.submit([&target_worker, &inp]() {
+            target_worker.prefill(inp);
         }).get();
 
         while (true) {
-            const bool done = steward.submit([&loop]() {
-                return loop.step();
+            const auto request = target_steward.submit([&target_worker]() {
+                return target_worker.prepare_draft_request();
+            }).get();
+
+            const auto draft_result = draft_steward.submit([&draft_worker, request]() {
+                return draft_worker.generate(request);
+            }).get();
+
+            const bool done = target_steward.submit([&target_worker, draft_result]() {
+                return target_worker.apply_draft_result(draft_result);
             }).get();
 
             if (done) {
@@ -478,13 +510,20 @@ int main(int argc, char ** argv) {
             }
         }
     } else {
-        loop.prefill(inp);
+        target_worker.prefill(inp);
 
-        while (!loop.step()) {
+        while (true) {
+            const auto request = target_worker.prepare_draft_request();
+            const auto draft_result = draft_worker.generate(request);
+
+            if (target_worker.apply_draft_result(draft_result)) {
+                break;
+            }
         }
     }
 
-    loop.print_summary();
+    target_worker.print_summary();
+    common_speculative_free(spec);
 
     llama_backend_free();
 
